@@ -56,6 +56,7 @@ class cosmopower_NN(tf.keras.Model):
                  trainable=True,
                  optimizer=None,
                  verbose=False, 
+                 delta=1.0,
                  ):
         """
         Constructor
@@ -75,6 +76,7 @@ class cosmopower_NN(tf.keras.Model):
             self.modes = modes
             self.n_modes = len(self.modes)
             self.n_hidden = n_hidden
+            self.delta = delta
 
             # architecture
             self.architecture = [self.n_parameters] + self.n_hidden + [self.n_modes]
@@ -486,7 +488,8 @@ class cosmopower_NN(tf.keras.Model):
             Tensor:
                 mean squared difference
         """
-        return tf.sqrt(tf.reduce_mean(tf.math.squared_difference(self.predictions_tf(training_parameters), training_features)))
+        error = self.predictions_tf(training_parameters) - training_features
+        return tf.reduce_mean(tf.keras.losses.huber(error, delta=self.delta))
 
 
     @tf.function
@@ -511,13 +514,8 @@ class cosmopower_NN(tf.keras.Model):
         """
         # compute loss on the tape
         with tf.GradientTape() as tape:
-
-            # loss
-            loss = tf.sqrt(tf.reduce_mean(tf.math.squared_difference(self.predictions_tf(training_parameters), training_features))) 
-
-        # compute gradients
+            loss = self.compute_loss(training_parameters, training_features)
         gradients = tape.gradient(loss, self.trainable_variables)
-
         return loss, gradients
 
 
@@ -540,10 +538,7 @@ class cosmopower_NN(tf.keras.Model):
         """
         # compute loss and gradients
         loss, gradients = self.compute_loss_and_gradients(training_parameters, training_features)
-
-        # apply gradients
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-
         return loss
 
 
