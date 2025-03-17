@@ -488,8 +488,10 @@ class cosmopower_NN(tf.keras.Model):
             Tensor:
                 mean squared difference
         """
-        error = self.predictions_tf(training_parameters) - training_features
-        return tf.reduce_mean(tf.keras.losses.huber(error, delta=self.delta))
+        predictions = self.predictions_tf(training_parameters)
+        error = predictions - training_features
+
+        return tf.reduce_mean(tf.keras.losses.huber(delta=self.delta)(training_features, predictions))
 
 
     @tf.function
