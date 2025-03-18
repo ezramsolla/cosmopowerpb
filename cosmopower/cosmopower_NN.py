@@ -55,8 +55,10 @@ class cosmopower_NN(tf.keras.Model):
                  restore_filename=None, 
                  trainable=True,
                  optimizer=None,
-                 verbose=False, 
-                 delta=1.0,
+                 verbose=False,
+                 lambda1=0.05,
+                 lambda2=0.05, 
+                 gamma=0.05
                  ):
         """
         Constructor
@@ -76,7 +78,10 @@ class cosmopower_NN(tf.keras.Model):
             self.modes = modes
             self.n_modes = len(self.modes)
             self.n_hidden = n_hidden
-            self.delta = delta
+            self.lambda1 = lambda1
+            self.lambda2 = lambda2
+            self.gamma = gamma
+            self.alphas = tf.constant([0.1, 0.3, 0.5, 0.7, 0.9, 0.99], dtype=tf.float32)
 
             # architecture
             self.architecture = [self.n_parameters] + self.n_hidden + [self.n_modes]
@@ -469,121 +474,80 @@ class cosmopower_NN(tf.keras.Model):
 
 
     ### Infrastructure for network training ###
+    @tf.function
+    def calibration_loss(self,training_features, delta_l, delta_u, alpha, lambda1=0.05, lambda2=0.05):
+    indicator = tf.cast((training_features >= delta_l) & (training_features <= delta_u), dtype=tf.float32)
+    
+    term1 = tf.abs(alpha - tf.reduce_mean(indicator))  
+    term2 = self.lambda1 * tf.abs(training_features - delta_l)  
+    term3 = self.lambda2 * tf.abs(delta_u - training_features)  
+
+    return tf.reduce_mean(term1 + term2 + term3)
+    
 
     @tf.function
-    def compute_loss(self,
-                     training_parameters,
-                     training_features
-                     ):
-        r"""
-        Mean squared difference
-
-        Parameters:
-            training_parameters (Tensor):
-                input parameters
-            training_features (Tensor):
-                true features
-
-        Returns:
-            Tensor:
-                mean squared difference
-        """
-        predictions = self.predictions_tf(training_parameters)
-        error = predictions - training_features
-
-        return tf.reduce_mean(tf.keras.losses.huber(delta=self.delta)(training_features, predictions))
+    def hinge_loss(self,training_features, delta_l, delta_u, gamma=0.05):
+    zero = tf.constant(0.0, dtype=tf.float32)
+    loss = tf.maximum(zero, (training_features - delta_l) + self.gamma) + \
+           tf.maximum(zero, (delta_u - training_features) + self.gamma)
+    
+    return tf.reduce_mean(loss)
 
 
     @tf.function
-    def compute_loss_and_gradients(self, 
-                                   training_parameters,
-                                   training_features
-                                   ):
-        r"""
-        Computes mean squared difference and gradients
+    def interval_predictions_tf(self, parameters_tensor):
+        outputs = []
+        layers = [tf.divide(tf.subtract(parameters_tensor, self.parameters_mean), self.parameters_std)]
+        for i in range(self.n_layers - 1):
+            outputs.append(tf.add(tf.matmul(layers[-1], self.W_interval[i]), self.b_interval[i]))
+            layers.append(self.activation(outputs[-1], self.alphas[i], self.betas[i]))
+        layers.append(tf.add(tf.matmul(layers[-1], self.W_interval[-1]), self.b_interval[-1]))
+        bounds = tf.add(tf.multiply(layers[-1], self.features_std), self.features_mean)
+        lower = bounds[:, ::2]  # Extract lower bounds
+        upper = lower + tf.nn.softplus(bounds[:, 1::2])  # Ensure upper > lower
+        return lower, upper
 
-        Parameters:
-            training_parameters (Tensor):
-                input parameters
-            training_features (Tensor):
-                true features
 
-        Returns:
-            loss (Tensor):
-                mean squared difference
-            gradients (Tensor):
-                gradients
-        """
-        # compute loss on the tape
+
+    @tf.function
+    def compute_loss(self, training_parameters, training_features):
+        f_pred = self.predictions_tf(training_parameters)
+        delta_l, delta_u = self.interval_predictions_tf(training_parameters)
+        
+        alpha_idx = tf.random.uniform(shape=[], minval=0, maxval=tf.shape(self.alphas)[0], dtype=tf.int32)
+        alpha = self.alphas[alpha_idx]
+        
+        cal_loss = calibration_loss(training_features, delta_l[:, alpha_idx], delta_u[:, alpha_idx], alpha, self.lambda1, self.lambda2)
+        hinge_loss_val = hinge_loss(training_features, delta_l[:, alpha_idx], delta_u[:, alpha_idx], self.gamma)
+        return cal_loss + hinge_loss_val
+
+
+    @tf.function
+    def compute_loss_and_gradients(self, training_parameters, training_features):
         with tf.GradientTape() as tape:
             loss = self.compute_loss(training_parameters, training_features)
         gradients = tape.gradient(loss, self.trainable_variables)
         return loss, gradients
 
 
-    def training_step(self, 
-                      training_parameters,
-                      training_features
-                      ):
-        r"""
-        Minimize loss
-
-        Parameters:
-            training_parameters (Tensor):
-                input parameters
-            training_features (Tensor):
-                true features
-
-        Returns:
-            loss (Tensor):
-                mean squared difference
-        """
-        # compute loss and gradients
+    def training_step(self, training_parameters, training_features):
         loss, gradients = self.compute_loss_and_gradients(training_parameters, training_features)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         return loss
 
 
-    def training_step_with_accumulated_gradients(self, 
-                                                 training_parameters, 
-                                                 training_features, 
-                                                 accumulation_steps=10):
-        r"""
-        Minimize loss, breaking calculation into accumulated gradients
-
-        Parameters:
-            training_parameters (Tensor):
-                input parameters
-            training_features (Tensor):
-                true features
-            accumulation_steps (int):
-                number of accumulated gradients
-
-        Returns:
-            accumulated_loss (Tensor):
-                mean squared difference
-        """
-        # create dataset to do sub-calculations over
-        dataset = tf.data.Dataset.from_tensor_slices((training_parameters, training_features)).batch(int(training_features.shape[0]/accumulation_steps))
-
-        # initialize gradients and loss (to zero)
-        accumulated_gradients = [tf.Variable(tf.zeros_like(variable), trainable=False) for variable in self.trainable_variables]
+    def training_step_with_accumulated_gradients(self, training_parameters, training_features, accumulation_steps=10):
+        dataset = tf.data.Dataset.from_tensor_slices((training_parameters, training_features)).batch(int(training_features.shape[0] / accumulation_steps))
+        accumulated_gradients = [tf.Variable(tf.zeros_like(var), trainable=False) for var in self.trainable_variables]
         accumulated_loss = tf.Variable(0., trainable=False)
 
-        # loop over sub-batches
-        for training_parameters_, training_features_, in dataset:
-
-            # calculate loss and gradients
+        for training_parameters_, training_features_ in dataset:
             loss, gradients = self.compute_loss_and_gradients(training_parameters_, training_features_)
-
-            # update the accumulated gradients and loss
             for i in range(len(accumulated_gradients)):
-                accumulated_gradients[i].assign_add(gradients[i]*training_features_.shape[0]/training_features.shape[0])
-            accumulated_loss.assign_add(loss*training_features_.shape[0]/training_features.shape[0])
+                accumulated_gradients[i].assign_add(gradients[i] * training_features_.shape[0] / training_features.shape[0])
+            accumulated_loss.assign_add(loss * training_features_.shape[0] / training_features.shape[0])
 
-            # apply accumulated gradients
-            self.optimizer.apply_gradients(zip(accumulated_gradients, self.trainable_variables))
-
+        self.optimizer.apply_gradients(zip(accumulated_gradients, self.trainable_variables))
         return accumulated_loss
 
 
