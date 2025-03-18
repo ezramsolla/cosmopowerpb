@@ -476,22 +476,22 @@ class cosmopower_NN(tf.keras.Model):
     ### Infrastructure for network training ###
     @tf.function
     def calibration_loss(self,training_features, delta_l, delta_u, alpha, lambda1=0.05, lambda2=0.05):
-    indicator = tf.cast((training_features >= delta_l) & (training_features <= delta_u), dtype=tf.float32)
+        indicator = tf.cast((training_features >= delta_l) & (training_features <= delta_u), dtype=tf.float32)
     
-    term1 = tf.abs(alpha - tf.reduce_mean(indicator))  
-    term2 = self.lambda1 * tf.abs(training_features - delta_l)  
-    term3 = self.lambda2 * tf.abs(delta_u - training_features)  
+        term1 = tf.abs(alpha - tf.reduce_mean(indicator))  
+        term2 = self.lambda1 * tf.abs(training_features - delta_l)  
+        term3 = self.lambda2 * tf.abs(delta_u - training_features)  
 
-    return tf.reduce_mean(term1 + term2 + term3)
+        return tf.reduce_mean(term1 + term2 + term3)
     
 
     @tf.function
     def hinge_loss(self,training_features, delta_l, delta_u, gamma=0.05):
-    zero = tf.constant(0.0, dtype=tf.float32)
-    loss = tf.maximum(zero, (training_features - delta_l) + self.gamma) + \
-           tf.maximum(zero, (delta_u - training_features) + self.gamma)
+        zero = tf.constant(0.0, dtype=tf.float32)
+        loss = tf.maximum(zero, (training_features - delta_l) + self.gamma) + \
+               tf.maximum(zero, (delta_u - training_features) + self.gamma)
     
-    return tf.reduce_mean(loss)
+        return tf.reduce_mean(loss)
 
 
     @tf.function
@@ -499,9 +499,9 @@ class cosmopower_NN(tf.keras.Model):
         outputs = []
         layers = [tf.divide(tf.subtract(parameters_tensor, self.parameters_mean), self.parameters_std)]
         for i in range(self.n_layers - 1):
-            outputs.append(tf.add(tf.matmul(layers[-1], self.W_interval[i]), self.b_interval[i]))
+            outputs.append(tf.add(tf.matmul(layers[-1], self.W[i]), self.b[i]))  # Use W and b
             layers.append(self.activation(outputs[-1], self.alphas[i], self.betas[i]))
-        layers.append(tf.add(tf.matmul(layers[-1], self.W_interval[-1]), self.b_interval[-1]))
+        layers.append(tf.add(tf.matmul(layers[-1], self.W[-1]), self.b[-1]))
         bounds = tf.add(tf.multiply(layers[-1], self.features_std), self.features_mean)
         lower = bounds[:, ::2]  # Extract lower bounds
         upper = lower + tf.nn.softplus(bounds[:, 1::2])  # Ensure upper > lower
@@ -517,8 +517,8 @@ class cosmopower_NN(tf.keras.Model):
         alpha_idx = tf.random.uniform(shape=[], minval=0, maxval=tf.shape(self.alphas)[0], dtype=tf.int32)
         alpha = self.alphas[alpha_idx]
         
-        cal_loss = calibration_loss(training_features, delta_l[:, alpha_idx], delta_u[:, alpha_idx], alpha, self.lambda1, self.lambda2)
-        hinge_loss_val = hinge_loss(training_features, delta_l[:, alpha_idx], delta_u[:, alpha_idx], self.gamma)
+        cal_loss = self.calibration_loss(training_features, delta_l[:, alpha_idx], delta_u[:, alpha_idx], alpha, self.lambda1, self.lambda2)
+        hinge_loss_val = self.hinge_loss(training_features, delta_l[:, alpha_idx], delta_u[:, alpha_idx], self.gamma)
         return cal_loss + hinge_loss_val
 
 
