@@ -5,6 +5,7 @@ import numpy as np
 import tensorflow as tf
 import pickle
 from tqdm import trange
+import tensorflow_probability as tfp
 dtype = tf.float32
 
 
@@ -55,10 +56,11 @@ class cosmopower_NN(tf.keras.Model):
                  restore_filename=None, 
                  trainable=True,
                  optimizer=None,
-                 verbose=False,
+                 verbose=False, 
                  lambda1=0.05,
                  lambda2=0.05, 
-                 gamma=0.05
+                 gamma=0.05,
+                 num_alpha=6
                  ):
         """
         Constructor
@@ -81,7 +83,8 @@ class cosmopower_NN(tf.keras.Model):
             self.lambda1 = lambda1
             self.lambda2 = lambda2
             self.gamma = gamma
-            self.alphas = tf.constant([0.1, 0.3, 0.5, 0.7, 0.9, 0.99], dtype=tf.float32)
+            self.num_alpha = num_alpha 
+            self.alphas1 = tf.constant([0.1, 0.3, 0.5, 0.7, 0.9, 0.99], dtype=tf.float32)
 
             # architecture
             self.architecture = [self.n_parameters] + self.n_hidden + [self.n_modes]
@@ -114,7 +117,12 @@ class cosmopower_NN(tf.keras.Model):
         for i in range(self.n_layers-1):
             self.alphas.append(tf.Variable(tf.random.normal([self.architecture[i+1]]), name = "alphas_" + str(i), trainable=trainable))
             self.betas.append(tf.Variable(tf.random.normal([self.architecture[i+1]]), name = "betas_" + str(i), trainable=trainable))
-
+        
+        self.learned_sigma = tf.Variable(
+            tf.ones([self.n_modes], dtype=tf.float32) * 0.05,
+            trainable=True,
+            name="learned_sigma"
+        )
         # restore weights if restore = True
         if restore is True:
             for i in range(self.n_layers):
@@ -255,7 +263,28 @@ class cosmopower_NN(tf.keras.Model):
             Tensor:
                 10^output rescaled predictions
         """
-        return tf.pow(10., self.rescaled_predictions_tf(parameters_tensor)) 
+        return tf.pow(10., self.rescaled_predictions_tf(parameters_tensor))
+
+    @tf.function
+    def interval_predictions_tf(self, parameters_tensor):
+    # Mean prediction from your main network
+        pred = self.predictions_tf(parameters_tensor)  # [batch, output_dim]
+
+    # Z-scores for each confidence level (alpha)
+        normal = tfp.distributions.Normal(loc=0., scale=1.)
+        z_scores = normal.quantile((1. + self.alphas1) / 2.0)  # [num_alpha]
+        z_scores = tf.reshape(z_scores, [1, -1, 1])            # [1, num_alpha, 1]
+
+    # Expand prediction and learned sigma for broadcasting
+        pred_exp = tf.expand_dims(pred, axis=1)                # [batch, 1, output_dim]
+        sigma_exp = tf.expand_dims(self.learned_sigma, axis=0) # [1, output_dim]
+        sigma_exp = tf.expand_dims(sigma_exp, axis=1)          # [1, 1, output_dim]
+
+    # Calculate intervals
+        delta_l = pred_exp - z_scores * sigma_exp
+        delta_u = pred_exp + z_scores * sigma_exp
+
+        return delta_l, delta_u 
 
 
 
@@ -471,83 +500,179 @@ class cosmopower_NN(tf.keras.Model):
                 10^output rescaled predictions
         """
         return 10.**self.rescaled_predictions_np(parameters_dict)
+    
 
 
     ### Infrastructure for network training ###
+
     @tf.function
-    def calibration_loss(self,training_features, delta_l, delta_u, alpha, lambda1=0.05, lambda2=0.05):
-        indicator = tf.cast((training_features >= delta_l) & (training_features <= delta_u), dtype=tf.float32)
+    def compute_loss(self,
+                     training_parameters,
+                     training_features
+                     ):
+        r"""
+        Mean squared difference
+
+        Parameters:
+            training_parameters (Tensor):
+                input parameters
+            training_features (Tensor):
+                true features
+
+        Returns:
+            Tensor:
+                mean squared difference
+        """
+        return tf.sqrt(tf.reduce_mean(tf.math.squared_difference(self.predictions_tf(training_parameters), training_features)))
     
-        term1 = tf.abs(alpha - tf.reduce_mean(indicator))  
-        term2 = self.lambda1 * tf.abs(training_features - delta_l)  
-        term3 = self.lambda2 * tf.abs(delta_u - training_features)  
+    @tf.function
+    def calibration_loss(self, training_features, delta_l, delta_u, alpha, alpha_idx, lambda1=0.05, lambda2=0.05):
+    # Select bounds for the current alpha
+        delta_l = delta_l[:, alpha_idx, :]  # shape [batch, output_dim]
+        delta_u = delta_u[:, alpha_idx, :]
+
+    # Indicator: is the true value inside the interval?
+        indicator = tf.cast((training_features >= delta_l) & (training_features <= delta_u), dtype=tf.float32)
+
+    # Term1: Calibration constraint (how well does interval contain the true value?)
+        term1 = tf.abs(alpha - tf.reduce_mean(indicator))
+
+    # Term2 and Term3: Width penalties
+        term2 = lambda1 * tf.reduce_mean(tf.abs(training_features - delta_l))
+        term3 = lambda2 * tf.reduce_mean(tf.abs(delta_u - training_features))
 
         return tf.reduce_mean(term1 + term2 + term3)
     
 
     @tf.function
-    def hinge_loss(self,training_features, delta_l, delta_u, gamma=0.05):
+    def hinge_loss(self, training_features, delta_l, delta_u, alpha_idx, gamma=0.05):
         zero = tf.constant(0.0, dtype=tf.float32)
-        loss = tf.maximum(zero, (training_features - delta_l) + self.gamma) + \
-               tf.maximum(zero, (delta_u - training_features) + self.gamma)
-    
+
+    # Select interval bounds corresponding to sampled alpha
+        delta_l = delta_l[:, alpha_idx, :]  # shape: [batch, output_dim]
+        delta_u = delta_u[:, alpha_idx, :]
+
+    # Compute hinge loss: Penalize when target is outside [delta_l, delta_u]
+        loss = tf.maximum(zero, delta_l - training_features + gamma) + \
+               tf.maximum(zero, training_features - delta_u + gamma)
+
         return tf.reduce_mean(loss)
-
-
+    
     @tf.function
-    def interval_predictions_tf(self, parameters_tensor):
-        outputs = []
-        layers = [tf.divide(tf.subtract(parameters_tensor, self.parameters_mean), self.parameters_std)]
-        for i in range(self.n_layers - 1):
-            outputs.append(tf.add(tf.matmul(layers[-1], self.W[i]), self.b[i]))  # Use W and b
-            layers.append(self.activation(outputs[-1], self.alphas[i], self.betas[i]))
-        layers.append(tf.add(tf.matmul(layers[-1], self.W[-1]), self.b[-1]))
-        bounds = tf.add(tf.multiply(layers[-1], self.features_std), self.features_mean)
-        lower = bounds[:, ::2]  # Extract lower bounds
-        upper = lower + tf.nn.softplus(bounds[:, 1::2])  # Ensure upper > lower
-        return lower, upper
-
-
-
-    @tf.function
-    def compute_loss(self, training_parameters, training_features):
-        f_pred = self.predictions_tf(training_parameters)
+    def combined_loss(self, training_parameters, training_features, lambda_weight=0.1):
         delta_l, delta_u = self.interval_predictions_tf(training_parameters)
-        
-        alpha_idx = tf.random.uniform(shape=[], minval=0, maxval=tf.shape(self.alphas)[0], dtype=tf.int32)
-        alpha = self.alphas[alpha_idx]
-        
-        cal_loss = self.calibration_loss(training_features, delta_l[:, alpha_idx], delta_u[:, alpha_idx], alpha, self.lambda1, self.lambda2)
-        hinge_loss_val = self.hinge_loss(training_features, delta_l[:, alpha_idx], delta_u[:, alpha_idx], self.gamma)
-        return cal_loss + hinge_loss_val
+    
+        alpha_idx = tf.random.uniform([], minval=0, maxval=tf.shape(self.alphas1)[0], dtype=tf.int32)
+        alpha = tf.gather(self.alphas1, alpha_idx)
+
+        hinge = self.hinge_loss(training_features, delta_l, delta_u, alpha_idx, gamma=self.gamma)
+        cal = self.calibration_loss(training_features, delta_l, delta_u, alpha, alpha_idx, lambda1=self.lambda1, lambda2=self.lambda2)
+
+        return hinge + lambda_weight * cal
 
 
     @tf.function
-    def compute_loss_and_gradients(self, training_parameters, training_features):
+    def compute_loss_and_gradients(self, 
+                                   training_parameters,
+                                   training_features,
+                                   lambda_weight=0.1
+                                   ):
+        r"""
+        Computes mean squared difference and gradients
+
+        Parameters:
+            training_parameters (Tensor):
+                input parameters
+            training_features (Tensor):
+                true features
+
+        Returns:
+            loss (Tensor):
+                mean squared difference
+            gradients (Tensor):
+                gradients
+        """
+        # compute loss on the tape
         with tf.GradientTape() as tape:
-            loss = self.compute_loss(training_parameters, training_features)
+
+            # loss
+            loss = self.combined_loss(training_parameters, training_features, lambda_weight)
+
+
+        # compute gradients
         gradients = tape.gradient(loss, self.trainable_variables)
+
         return loss, gradients
 
 
-    def training_step(self, training_parameters, training_features):
-        loss, gradients = self.compute_loss_and_gradients(training_parameters, training_features)
+    def training_step(self, 
+                      training_parameters,
+                      training_features,
+                      lambda_weight=0.1
+                      ):
+        r"""
+        Minimize loss
+
+        Parameters:
+            training_parameters (Tensor):
+                input parameters
+            training_features (Tensor):
+                true features
+
+        Returns:
+            loss (Tensor):
+                mean squared difference
+        """
+        # compute loss and gradients
+        loss, gradients = self.compute_loss_and_gradients(training_parameters, training_features, lambda_weight)
+
+        # apply gradients
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+
         return loss
 
 
-    def training_step_with_accumulated_gradients(self, training_parameters, training_features, accumulation_steps=10):
-        dataset = tf.data.Dataset.from_tensor_slices((training_parameters, training_features)).batch(int(training_features.shape[0] / accumulation_steps))
-        accumulated_gradients = [tf.Variable(tf.zeros_like(var), trainable=False) for var in self.trainable_variables]
+    def training_step_with_accumulated_gradients(self, 
+                                                 training_parameters, 
+                                                 training_features, 
+                                                 accumulation_steps=10,
+                                                 lambda_weight=0.1):
+        r"""
+        Minimize loss, breaking calculation into accumulated gradients
+
+        Parameters:
+            training_parameters (Tensor):
+                input parameters
+            training_features (Tensor):
+                true features
+            accumulation_steps (int):
+                number of accumulated gradients
+
+        Returns:
+            accumulated_loss (Tensor):
+                mean squared difference
+        """
+        # create dataset to do sub-calculations over
+        dataset = tf.data.Dataset.from_tensor_slices((training_parameters, training_features)).batch(int(training_features.shape[0]/accumulation_steps))
+
+        # initialize gradients and loss (to zero)
+        accumulated_gradients = [tf.Variable(tf.zeros_like(variable), trainable=False) for variable in self.trainable_variables]
         accumulated_loss = tf.Variable(0., trainable=False)
 
-        for training_parameters_, training_features_ in dataset:
-            loss, gradients = self.compute_loss_and_gradients(training_parameters_, training_features_)
-            for i in range(len(accumulated_gradients)):
-                accumulated_gradients[i].assign_add(gradients[i] * training_features_.shape[0] / training_features.shape[0])
-            accumulated_loss.assign_add(loss * training_features_.shape[0] / training_features.shape[0])
+        # loop over sub-batches
+        for training_parameters_, training_features_, in dataset:
 
-        self.optimizer.apply_gradients(zip(accumulated_gradients, self.trainable_variables))
+            # calculate loss and gradients
+            loss, gradients = self.compute_loss_and_gradients(training_parameters_, training_features_, lambda_weight)
+
+            # update the accumulated gradients and loss
+            for i in range(len(accumulated_gradients)):
+                accumulated_gradients[i].assign_add(gradients[i]*training_features_.shape[0]/training_features.shape[0])
+            accumulated_loss.assign_add(loss*training_features_.shape[0]/training_features.shape[0])
+
+            # apply accumulated gradients
+            self.optimizer.apply_gradients(zip(accumulated_gradients, self.trainable_variables))
+
         return accumulated_loss
 
 
@@ -568,8 +693,8 @@ class cosmopower_NN(tf.keras.Model):
               batch_sizes=[1024, 1024, 1024, 1024, 1024],
               gradient_accumulation_steps = [1, 1, 1, 1, 1],
               # early stopping set up
-              patience_values = [100, 100, 100, 100, 100],
-              max_epochs = [1000, 1000, 1000, 1000, 1000],
+              patience_values = [10, 10, 10, 10, 10],
+              max_epochs = [50, 50, 50, 50, 50],
              ):
         r"""
         Train the model
@@ -720,9 +845,9 @@ class cosmopower_NN(tf.keras.Model):
 
                         # training step: check whether to accumulate gradients or not (only worth doing this for very large batch sizes)
                         if gradient_accumulation_steps[i] == 1:
-                            loss = self.training_step(theta, feats)
+                            loss = self.training_step(theta, feats,lambda_weight=0.1)
                         else:
-                            loss = self.training_step_with_accumulated_gradients(theta, feats, accumulation_steps=gradient_accumulation_steps[i])
+                            loss = self.training_step_with_accumulated_gradients(theta, feats, accumulation_steps=gradient_accumulation_steps[i],lambda_weight=0.1)
 
                     # compute validation loss at the end of the epoch
                     validation_loss.append(self.compute_loss(training_parameters[~training_selection], training_features[~training_selection]).numpy())
