@@ -527,17 +527,16 @@ class cosmopower_NN(tf.keras.Model):
     
     @tf.function
     def calibration_loss(self, training_features, delta_l, delta_u, alpha, alpha_idx, lambda1=0.05, lambda2=0.05):
-    # Select bounds for the current alpha
+
         delta_l = delta_l[:, alpha_idx, :]  # shape [batch, output_dim]
         delta_u = delta_u[:, alpha_idx, :]
 
-    # Indicator: is the true value inside the interval?
         indicator = tf.cast((training_features >= delta_l) & (training_features <= delta_u), dtype=tf.float32)
 
-    # Term1: Calibration constraint (how well does interval contain the true value?)
+
         term1 = tf.abs(alpha - tf.reduce_mean(indicator))
 
-    # Term2 and Term3: Width penalties
+
         term2 = lambda1 * tf.reduce_mean(tf.abs(training_features - delta_l))
         term3 = lambda2 * tf.reduce_mean(tf.abs(delta_u - training_features))
 
@@ -548,11 +547,11 @@ class cosmopower_NN(tf.keras.Model):
     def hinge_loss(self, training_features, delta_l, delta_u, alpha_idx, gamma=0.05):
         zero = tf.constant(0.0, dtype=tf.float32)
 
-    # Select interval bounds corresponding to sampled alpha
-        delta_l = delta_l[:, alpha_idx, :]  # shape: [batch, output_dim]
+  
+        delta_l = delta_l[:, alpha_idx, :] 
         delta_u = delta_u[:, alpha_idx, :]
 
-    # Compute hinge loss: Penalize when target is outside [delta_l, delta_u]
+
         loss = tf.maximum(zero, delta_l - training_features + gamma) + \
                tf.maximum(zero, training_features - delta_u + gamma)
 
@@ -568,41 +567,48 @@ class cosmopower_NN(tf.keras.Model):
         hinge = self.hinge_loss(training_features, delta_l, delta_u, alpha_idx, gamma=self.gamma)
         cal = self.calibration_loss(training_features, delta_l, delta_u, alpha, alpha_idx, lambda1=self.lambda1, lambda2=self.lambda2)
 
-        return hinge + lambda_weight * cal
+        return hinge 
 
 
     @tf.function
     def compute_loss_and_gradients(self, 
-                                   training_parameters,
-                                   training_features,
-                                   lambda_weight=0.1
-                                   ):
-        r"""
-        Computes mean squared difference and gradients
+                                    training_parameters,
+                                    training_features,
+                                    lambda_weight=0.1):
 
-        Parameters:
-            training_parameters (Tensor):
-                input parameters
-            training_features (Tensor):
-                true features
+        with tf.GradientTape(persistent=True) as tape:
+        
+            delta_l, delta_u = self.interval_predictions_tf(training_parameters)
+            alpha_idx = tf.random.uniform([], minval=0, maxval=tf.shape(self.alphas1)[0], dtype=tf.int32)
+            alpha = tf.gather(self.alphas1, alpha_idx)
+ 
 
-        Returns:
-            loss (Tensor):
-                mean squared difference
-            gradients (Tensor):
-                gradients
-        """
-        # compute loss on the tape
-        with tf.GradientTape() as tape:
-
-            # loss
-            loss = self.combined_loss(training_parameters, training_features, lambda_weight)
+            cal_loss = self.calibration_loss(training_features, delta_l, delta_u, alpha, alpha_idx,
+                                             lambda1=self.lambda1, lambda2=self.lambda2)
 
 
-        # compute gradients
-        gradients = tape.gradient(loss, self.trainable_variables)
+            hinge_loss = self.hinge_loss(training_features, delta_l, delta_u, alpha_idx, gamma=self.gamma)
 
-        return loss, gradients
+            
+            total_loss = hinge_loss
+
+        
+        theta_vars = [v for v in self.trainable_variables if 'prediction' in v.name]
+        phi_vars   = [v for v in self.trainable_variables if 'interval' in v.name]
+
+        # Compute gradients for each
+        grad_theta = tape.gradient(hinge_loss, theta_vars)
+        grad_phi   = tape.gradient(cal_loss, phi_vars)
+
+        gradients = []
+        for v in self.trainable_variables:
+            if v in theta_vars:
+                gradients.append(grad_theta[theta_vars.index(v)])
+            else:
+                gradients.append(grad_phi[phi_vars.index(v)])
+
+        del tape
+        return total_loss, gradients
 
 
     def training_step(self, 
