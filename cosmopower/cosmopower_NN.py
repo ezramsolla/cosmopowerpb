@@ -558,7 +558,7 @@ class cosmopower_NN(tf.keras.Model):
         return tf.reduce_mean(loss)
     
     @tf.function
-    def combined_loss(self, training_parameters, training_features, lambda_weight=0.1):
+    def combined_loss(self, training_parameters, training_features, lambda_weight=2):
         delta_l, delta_u = self.interval_predictions_tf(training_parameters)
     
         alpha_idx = tf.random.uniform([], minval=0, maxval=tf.shape(self.alphas1)[0], dtype=tf.int32)
@@ -574,7 +574,7 @@ class cosmopower_NN(tf.keras.Model):
     def compute_loss_and_gradients(self, 
                                     training_parameters,
                                     training_features,
-                                    lambda_weight=0.1):
+                                    lambda_weight=2):
 
         with tf.GradientTape(persistent=True) as tape:
         
@@ -614,7 +614,7 @@ class cosmopower_NN(tf.keras.Model):
     def training_step(self, 
                       training_parameters,
                       training_features,
-                      lambda_weight=0.1
+                      lambda_weight=2
                       ):
         r"""
         Minimize loss
@@ -642,7 +642,7 @@ class cosmopower_NN(tf.keras.Model):
                                                  training_parameters, 
                                                  training_features, 
                                                  accumulation_steps=10,
-                                                 lambda_weight=0.1):
+                                                 lambda_weight=2):
         r"""
         Minimize loss, breaking calculation into accumulated gradients
 
@@ -849,11 +849,11 @@ class cosmopower_NN(tf.keras.Model):
                     # loop over batches
                     for theta, feats in training_data:
 
-                        # training step: check whether to accumulate gradients or not (only worth doing this for very large batch sizes)
+                        # training step: check whether to accumulate gradients or not
                         if gradient_accumulation_steps[i] == 1:
                             loss = self.training_step(theta, feats,lambda_weight=0.1)
                         else:
-                            loss = self.training_step_with_accumulated_gradients(theta, feats, accumulation_steps=gradient_accumulation_steps[i],lambda_weight=0.1)
+                            loss = self.training_step_with_accumulated_gradients(theta, feats, accumulation_steps=gradient_accumulation_steps[i],lambda_weight=2)
 
                     # compute validation loss at the end of the epoch
                     validation_loss.append(self.compute_loss(training_parameters[~training_selection], training_features[~training_selection]).numpy())
