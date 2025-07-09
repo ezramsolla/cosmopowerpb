@@ -694,13 +694,13 @@ class cosmopower_NN(tf.keras.Model):
               postprocessing_tf=None,
               processing_vectors={},
               # cooling schedule
-              validation_split=0.1,
+              validation_split=0.2,
               learning_rates=[1e-2, 1e-3, 1e-4, 1e-5, 1e-6],
               batch_sizes=[1024, 1024, 1024, 1024, 1024],
               gradient_accumulation_steps = [1, 1, 1, 1, 1],
               # early stopping set up
-              patience_values = [10, 10, 10, 10, 10],
-              max_epochs = [50, 50, 50, 50, 50],
+              patience_values = [100, 100, 100, 100, 100],
+              max_epochs = [1000, 1000, 1000, 1000, 1000],
              ):
         r"""
         Train the model
